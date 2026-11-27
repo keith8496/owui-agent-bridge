@@ -1,6 +1,28 @@
-# OWUI + Open Terminal Agent Bridge Investigation
+# OWUI + Open Terminal Agent Bridge
 
-Status: initial architecture findings; no implementation changes made.
+Status: architecture findings and agreed implementation requirements; documentation only, no Manifold implementation or runtime test yet.
+
+## Agreed implementation requirements
+
+- Ship the final deliverable as one installable Python Open WebUI Pipe/Manifold file.
+- Target Open WebUI 0.13.5.
+- Expose ACP agent models in the regular OWUI model picker and route their requests to a configured dedicated Open Terminal agent host, regardless of which workspace machine remains selected in the chat UI.
+- Use a thin adapter around OWUI's existing ACP implementation. Prefer importing/calling its existing logic; keep copied code to the minimum needed to bridge the Pipe to the dedicated host. Expect private internal APIs to be version-sensitive and verify their exact 0.13.5 signatures before implementation.
+- Configure the agent-host URL and API key using Pipe Valves. Include a user ID Valve only if the host/API requires it; default it to `user`.
+- Discover models from the agent host and expose them through the Manifold's dynamic model list (`pipes()`). Keep base model IDs and effort as separate values/options; do not create picker IDs by concatenating effort, for example `gemini-3-high`.
+- Follow the existing OWUI ACP implementation for supported chat behavior, session semantics, authentication/ownership expectations, event handling, cancellation, and cleanup. The desired end state is feature-to-feature parity, not a permanently text-only replacement.
+
+### Delivery milestones
+
+1. **Conversation proof and model discovery:** discover agent models and complete a basic turn through the dedicated host.
+2. **Streaming and chat resume:** match the existing ACP stream and resume behavior.
+3. **Attachments and images:** match the existing attachment/image path, including base64 image content where applicable.
+
+These milestones sequence implementation and verification; they do not reduce the final parity goal. Verify the actual Pipe and ACP integration against OWUI 0.13.5 and the deployed Open Terminal agent API.
+
+### Execution boundary
+
+The Pipe redirects the ACP agent transport, not the workspace machine's shell or filesystem. The CLI process and its native filesystem/shell operations run on the dedicated agent host unless a separate, explicit remote-workspace mechanism is added and verified. Keeping the normal workspace machine selected does not imply that the agent operates inside it.
 
 ## Goal
 
@@ -89,26 +111,38 @@ Separating agent-host routing from the selected workspace is not the same as mak
 - Shared mounts can share files but commands still execute in the agent host environment.
 - Routing workspace operations remotely would be a separate integration, dependent on actual provider behavior and ACP tool semantics.
 
-## Proposed proof of concept
+## Implementation investigation and plan
 
-1. Add a Manifold entry for the chosen agent/model, configured with the dedicated Open Terminal base URL and credentials using a safe server-side mechanism (never embed secrets in the function source or chat-visible model metadata).
-2. From the pipe, create an agent session on the dedicated host and connect to its WebSocket.
-3. Implement the minimum ACP sequence for one text-only turn: initialize, session/new, model selection if required, session/prompt, consume session/update, return streamed text to OWUI, then clean up.
-4. Keep the foreground machine selected and confirm it remains the workspace context.
-5. Test lifecycle and safety: auth failures, disconnect/reconnect, cancellation, duplicate turns, session cleanup, and no accidental exposure of agent-host credentials.
-6. Separately test where CLI filesystem and shell operations actually execute before claiming workspace sharing.
+The intended interception point is the boundary where OWUI's ACP adapter sends protocol traffic through `MachineTransport`. The Manifold should preserve OWUI's prompt/session/update behavior and replace only the transport resolution/connection so ACP frames go to the configured dedicated Open Terminal host rather than the selected machine.
 
-Possible implementation choice: copy the small required ACP/transport subset into the pipe for a first POC, or import OWUI internals behind a thin adapter. Direct imports reduce duplication but couple the pipe to private APIs and `Output` semantics. Decide after the simplest text-streaming experiment.
+Before coding, inspect the exact Open WebUI 0.13.5 implementations and signatures for:
 
-## Open questions / risks
+- `backend/open_webui/utils/agents/acp.py`: ACP client, initialization, prompt, updates, approvals/elicitation, cancellation, and session continuation.
+- `backend/open_webui/utils/agents/runner.py`: provider/model dispatch and preparation of prompt, options, attachments, and state.
+- `backend/open_webui/utils/agents/transport.py`: session creation, authenticated WebSocket connection, sequencing, acknowledgements, reconnect, and cleanup; identify the smallest substitutable transport seam.
+- Manifold `pipes()` and Pipe invocation context on OWUI 0.13.5, including Valve configuration and how dynamic model IDs/options are passed to a request.
+- Open Terminal's provider model-discovery and session endpoints, confirming their behavior for `agy` ACP.
 
-- How should pipe-specific credentials and endpoint configuration be stored/rotated in this deployment?
-- Should a pipe own provider/model discovery, or use a statically configured model catalog for the POC?
-- Which ACP operations/options are required for Antigravity specifically?
-- What exact tool operations does `agy acp` execute locally versus delegate to ACP client capabilities?
-- Should sessions persist across chat turns, and how will the pipe persist/validate provider session IDs?
-- How should approval events and user interaction map to pipe event calls?
-- The agent API has session ownership and authentication constraints; preserve them and avoid exposing its port publicly.
+Prefer calling/importing OWUI code behind the Pipe adapter. If a private function depends on machine-specific request state or cannot accept a substituted transport, copy only the smallest necessary portion and document its upstream source/version. Do not reimplement ACP parsing or event semantics wholesale.
+
+Implement and verify in the agreed phases:
+
+1. Dynamic model discovery plus a basic conversation turn.
+2. Incremental streaming and chat resume/session continuation.
+3. File attachments and image pipeline/base64 handling.
+
+At each phase confirm the foreground workspace selection is unchanged, requests reach only the configured agent host, ACP model and effort remain separate, cancellation/cleanup remain consistent with OWUI, and failures do not leak credentials. Final acceptance is feature parity with the supported existing ACP path, not merely the phase-one proof.
+
+## Remaining implementation checks
+
+These are source/runtime checks for implementation, not unresolved product choices:
+
+- Confirm exact import paths, call signatures, and injectable seams in the locally available OWUI 0.13.5 source; internal imports are intentionally accepted but version-sensitive.
+- Confirm model-discovery response shape and how ACP effort/options are represented for `agy`; expose one picker entry per base model and pass effort separately.
+- Confirm the host authentication and optional user-ID requirements, and preserve Open Terminal's session ownership checks.
+- Confirm Pipe support for the existing ACP update/event flow, cancellation, and session state in this OWUI version.
+- Confirm attachment and image payload encoding against the existing OWUI ACP implementation and Open Terminal transport.
+- Test actual filesystem/shell execution location; do not infer remote workspace access from routing or shared files.
 
 ## Verification status
 
