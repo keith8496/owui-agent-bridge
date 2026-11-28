@@ -1,6 +1,6 @@
 # OWUI + Open Terminal Agent Bridge
 
-Status: architecture findings and agreed implementation requirements; documentation only, no Manifold implementation or runtime test yet.
+Status: Phase-one discovery and basic text-turn implementation is in place. Unit tests pass, and a user-reported smoke test passed. Streaming/resume and attachment/image parity remain future milestones.
 
 ## Agreed implementation requirements
 
@@ -111,6 +111,29 @@ Separating agent-host routing from the selected workspace is not the same as mak
 - Shared mounts can share files but commands still execute in the agent host environment.
 - Routing workspace operations remotely would be a separate integration, dependent on actual provider behavior and ACP tool semantics.
 
+## Verified source signatures and adapter boundary
+
+Open WebUI source was verified in `/home/u7de088ca/Repos/open-webui` at tag `v0.13.5`, commit `926f826eaef6179c092a936eede6c7363e425975`.
+
+- `backend/open_webui/utils/agents/acp.py`: `Client(transport, handle)` consumes `transport.write(str)` and `transport.read_messages()` (an async iterator of decoded JSON-RPC dictionaries). `async run(transport, output, prompt, images, options, *, auth_method=None)` implements ACP initialization, sessions, model/reasoning selection, prompt updates, approvals, elicitation, and cancellation.
+- `backend/open_webui/utils/agents/transport.py`: `MachineTransport(connection, headers, cookies, user_id)` is directly constructible; `start(provider, options)`, `write(data)`, `read_messages()`, `close()`, and `end_input()` form its useful carrier API. `resolve(request, user, metadata)` is machine-bound and unsuitable for the configured-host route.
+- `backend/open_webui/utils/agents/output.py`: `Output(metadata, user, check_connection, form_data)` persists output cards and agent session state, emits chat completion events, and supplies ACP approval/elicitation interactions. Its use from a Pipe is version-sensitive and must be exercised in OWUI.
+- `backend/open_webui/utils/agents/runner.py`: `async run(request, form_data, user, metadata, model)` is not a transport-injection seam. It resolves the selected machine, obtains its cwd, uploads files to it, builds transcript/resume state, and orchestrates output/cleanup. Calling the runner would retain workspace coupling even if the ACP transport were independently redirected.
+- `backend/open_webui/utils/agents/discovery.py`: `async get_models(request, user, metadata, *, provider=None, cwd=None)` requires machine metadata and therefore is not usable for independent host discovery.
+- `backend/open_webui/functions.py`: manifold `pipes()` may be synchronous or async and yields child IDs/names; Pipe invocation receives selected context keys including `body`, `__user__`, `__metadata__`, `__request__`, `__event_emitter__`, `__event_call__`, `__files__`, and chat/session/message IDs.
+
+The narrowest suitable reuse boundary is constructing a `MachineTransport` instance against an explicit connection/configuration, then using OWUI `Output` and `acp.run` directly. Do not monkey-patch global runner or transport functions: concurrent requests could cross-route. A Pipe-owned orchestration path is needed for chat/session setup, because `runner.run` also couples cwd and attachments to the selected workspace machine. Keep phase one deliberately small and state its limitations; later phases must add compatible saved-chat resume, streaming, and attachment/image behavior before claiming parity.
+
+## Verified Open Terminal API
+
+Local source is at `/home/u7de088ca/Repos/open-terminal`; no runtime API request was made.
+
+- `GET /agents?provider=antigravity&cwd=...` returns `protocol_version: 1` and agents with `id`, `name`, `available`, `models`, and optional errors. Model objects include base `id`, display `name`, and `supportedReasoningEfforts`; effort must remain an option and must not be concatenated into picker IDs.
+- Discovery launches the provider CLI and performs ACP `initialize` plus `session/new`; it is not a separate ACP-specific HTTP endpoint.
+- `POST /agents/antigravity/sessions` accepts a `Start` body with required `request_id`, plus `cwd`, `model`, `resume`, `resume_at`, `fork`, `instructions`, and `approval_mode`. It returns session ID and lifecycle metadata.
+- REST endpoints use bearer authentication when configured. Creation requires `X-Session-Id`; ownership is keyed by `X-User-Id` (default `single`) and session ID. WebSocket authentication is an initial JSON frame containing `type=auth`, token, and cursor.
+- WebSocket frames carry sequenced JSONL in `input` and `output`, with acknowledgements, EOF, and exit frames. The OWUI `MachineTransport` already implements replay, reconnect, sequencing, and cleanup; it should be reused rather than duplicated where its configuration permits.
+
 ## Implementation investigation and plan
 
 The intended interception point is the boundary where OWUI's ACP adapter sends protocol traffic through `MachineTransport`. The Manifold should preserve OWUI's prompt/session/update behavior and replace only the transport resolution/connection so ACP frames go to the configured dedicated Open Terminal host rather than the selected machine.
@@ -146,7 +169,7 @@ These are source/runtime checks for implementation, not unresolved product choic
 
 ## Verification status
 
-- Source code inspected locally in both repositories.
-- No files in either repository were modified for this investigation.
-- No agent API runtime calls or end-to-end tests were run during this investigation.
-- The current note is a working design record, not implementation documentation.
+- Open WebUI source signatures were inspected against tag `v0.13.5`; Open Terminal protocol details were checked in the local source.
+- The single-file phase-one implementation is `owui_agent_bridge.py`; it dynamically discovers available Antigravity base models, uses Valve-configured host/key/user ID, and calls OWUI's ACP runner and reconnectable carrier.
+- `tests/test_owui_agent_bridge.py` covers discovery, config/routing, session payload, basic text turn, input rejection, and cleanup. Unit tests pass; the user also reports a successful smoke test in their OWUI/Open Terminal instance.
+- Phase one does not yet provide streaming/resume parity or file/image attachment support. Do not treat it as full feature parity.
