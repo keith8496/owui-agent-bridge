@@ -100,9 +100,12 @@ class Pipe:
         __metadata__: Optional[dict] = None,
         __request__=None,
         __event_emitter__=None,
+        __event_call__=None,
     ):
         """Run one ACP turn on the configured host; phase one returns a final message."""
         from open_webui.utils.agents import acp
+        from open_webui.models.chats import Chats
+        from open_webui.utils.auth import decode_token
         from open_webui.utils.agents.output import Output
         from open_webui.utils.agents.transport import MachineTransport
 
@@ -113,6 +116,17 @@ class Pipe:
         message_id = metadata.get("message_id")
         if not chat_id or not message_id:
             raise ValueError("Save this chat before using the Antigravity manifold")
+        owui_user_id = user.get("id") if isinstance(user, dict) else getattr(user, "id", None)
+        owui_user_role = user.get("role") if isinstance(user, dict) else getattr(user, "role", None)
+        if not isinstance(owui_user_id, (str, int)) or not str(owui_user_id).strip():
+            raise ValueError("An authenticated Open WebUI user is required")
+        if not isinstance(owui_user_role, str) or not owui_user_role.strip():
+            raise ValueError("An authenticated Open WebUI user role is required")
+        owui_user_id = str(owui_user_id)
+        acp_user = type("PipeUser", (), {"id": owui_user_id, "role": owui_user_role})()
+        chat = await Chats.get_accessible_chat_by_id(str(chat_id), acp_user, permission="write")
+        if chat is None:
+            raise ValueError("Chat reply access denied")
 
         model_id = str(body.get("model", "")).rsplit(".", 1)[-1]
         if not model_id:
@@ -145,7 +159,41 @@ class Pipe:
             {},
             self.valves.user_id or "user",
         )
-        acp_user = type("PipeUser", (), {"id": str(getattr(user, "id", None) or user.get("id") or "user")})()
+        user_message = metadata.get("user_message") or {}
+        parent_id = user_message.get("parentId") or metadata.get("user_message_id")
+        previous = None
+        try:
+            messages_by_id = await Chats.get_messages_map_by_chat_id(str(chat_id)) or {}
+            visited = set()
+            current_id = parent_id
+            while current_id and current_id not in visited:
+                visited.add(current_id)
+                saved = messages_by_id.get(current_id)
+                if not saved:
+                    break
+                token = (saved.get("meta") or {}).get("agent")
+                try:
+                    state = decode_token(token) if isinstance(token, str) else None
+                except Exception:
+                    state = None
+                if state:
+                    if (
+                        state.get("typ") == "agent_session"
+                        and state.get("chat") == str(chat_id)
+                        and state.get("user") == owui_user_id
+                        and state.get("instance_user_id") == (self.valves.user_id or "user")
+                        and state.get("provider") == "antigravity"
+                        and state.get("model") == model_id
+                        and state.get("cwd") == self.valves.cwd
+                        and isinstance(state.get("session_id"), str)
+                        and state["session_id"]
+                    ):
+                        previous = state
+                    break
+                current_id = saved.get("parentId")
+        except Exception:
+            previous = None
+
         output_metadata = {
             **metadata,
             "chat_id": str(chat_id),
@@ -157,9 +205,10 @@ class Pipe:
             "provider": "antigravity",
             "model": model_id,
             "cwd": self.valves.cwd,
-            "user": self.valves.user_id or "user",
+            "user": owui_user_id,
             "instance_user_id": self.valves.user_id or "user",
             "chat": str(chat_id),
+            **({key: previous[key] for key in ("session_id", "model_config") if key in previous} if previous else {}),
         }
         params = body.get("params") or {}
         custom_params = params.get("custom_params") or {}
@@ -189,18 +238,24 @@ class Pipe:
             "request_id": str(message_id),
             "cwd": self.valves.cwd,
             "model": model_id,
-            "resume": None,
+            "resume": (previous or {}).get("session_id"),
             "instructions": "",
             "approval_mode": "ask",
-            "resume_state": {},
+            "resume_state": previous or {},
             "params": params,
         }
+        succeeded = False
         try:
             await transport.start("antigravity", options)
-            await acp.run(transport, output, prompt, [], options)
+            await acp.run(transport, output, prompt, [], {**options, "resume_state": previous or {}})
+            succeeded = True
             return output.content
         finally:
             await transport.close()
+            for item in output.items:
+                if item.get("status") in {"pending", "in_progress"}:
+                    item["status"] = "completed" if succeeded else "incomplete"
+            await output.flush(done=True, force=True)
 
 
 # Keep this module importable in a minimal test environment without OWUI internals.

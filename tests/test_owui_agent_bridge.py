@@ -37,17 +37,61 @@ class DummyOutput:
     def __init__(self, metadata, user, check_connection, form_data):
         self.metadata = metadata
         self.user = user
-        self.content = "assistant reply"
+        self.content = ""
+        self.items = []
         self.state = {}
+        self.events = []
+        self.on_flush = None
+
+    async def text(self, text, reasoning=False):
+        self.content += text
+        self.items.append({"type": "reasoning" if reasoning else "message", "content": text, "status": "in_progress"})
+        await self.flush()
+
+    async def flush(self, done=False, force=False):
+        self.events.append({"content": self.content, "done": done, "force": force})
+        if self.on_flush:
+            self.on_flush(done, force)
 
 
 @pytest.fixture
 def owui_stubs(monkeypatch):
     DummyTransport.instances = []
     calls = []
+    saved_messages = {}
+    chat_heads = {}
+    accepted_chats = {"chat-123"}
+
+    class ChatsStub:
+        @staticmethod
+        async def get_accessible_chat_by_id(chat_id, user, permission="write"):
+            assert user.id == "owui-user"
+            assert user.role == "user"
+            return {"id": chat_id} if chat_id in accepted_chats else None
+
+        @staticmethod
+        async def get_messages_map_by_chat_id(chat_id):
+            return saved_messages.get(chat_id, {})
+
+        @staticmethod
+        async def get_chat_by_id(chat_id):
+            return {"current_message_id": chat_heads.get(chat_id)}
+
+    tokens = {}
 
     async def acp_run(transport, output, prompt, images, options):
         calls.append((transport, output, prompt, images, options))
+        output.state.update({"typ": "agent_session", "provider": "antigravity", "model": "gemini-4-hydrogen", "cwd": "/data/workspace", "session_id": f"agy-session-{len(calls)}"})
+        # Mirror Output.save's authenticated user/chat claims and state merge.
+        tokens[f"signed-{len(calls)}"] = {"typ": "agent_session", "user": output.user.id, "chat": output.metadata["chat_id"], **output.state}
+        output.metadata.setdefault("meta", {})["agent"] = f"signed-{len(calls)}"
+        output.metadata["parent_id"] = "assistant-1" if len(calls) > 1 else None
+        output.metadata["message_id"] = f"assistant-{len(calls)}"
+        message = {"id": f"assistant-{len(calls)}", "parentId": output.metadata["parent_id"], "meta": {"agent": f"signed-{len(calls)}"}}
+        saved_messages.setdefault("chat-123", {})[message["id"]] = message
+        chat_heads["chat-123"] = message["id"]
+        await output.text("hello ")
+        await output.text("world")
 
     agents = types.ModuleType("open_webui.utils.agents")
     agents.acp = types.SimpleNamespace(run=acp_run)
@@ -56,8 +100,15 @@ def owui_stubs(monkeypatch):
     transport_module = types.ModuleType("open_webui.utils.agents.transport")
     transport_module.MachineTransport = DummyTransport
 
+    chats_module = types.ModuleType("open_webui.models.chats")
+    chats_module.Chats = ChatsStub
+    auth_module = types.ModuleType("open_webui.utils.auth")
+    auth_module.decode_token = lambda token: tokens.get(token)
     modules = {
         "open_webui": types.ModuleType("open_webui"),
+        "open_webui.models": types.ModuleType("open_webui.models"),
+        "open_webui.models.chats": chats_module,
+        "open_webui.utils.auth": auth_module,
         "open_webui.utils": types.ModuleType("open_webui.utils"),
         "open_webui.utils.agents": agents,
         "open_webui.utils.agents.output": output_module,
@@ -65,7 +116,7 @@ def owui_stubs(monkeypatch):
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
-    return calls
+    return {"calls": calls, "messages": saved_messages, "tokens": tokens, "chats": accepted_chats, "heads": chat_heads}
 
 
 def catalog(*, protocol=1, available=True, models=None):
@@ -188,19 +239,22 @@ def test_empty_instructions_and_basic_text_turn(owui_stubs, monkeypatch):
                 "model": "antigravity.gemini-4-hydrogen",
                 "messages": [{"role": "user", "content": "Hello"}],
             },
-            __user__={"id": "owui-user"},
+            __user__={"id": "owui-user", "role": "user"},
             __metadata__={"chat_id": "chat-123", "message_id": "message-456"},
         )
     )
 
-    transport, output, prompt, images, options = owui_stubs[0]
-    assert result == "assistant reply"
+    transport, output, prompt, images, options = owui_stubs["calls"][0]
+    assert result == "hello world"
     assert transport.connection["url"] == "http://agent-host:8000"
     assert transport.headers["X-User-Id"] == "agent47"
     assert transport.headers["X-Session-Id"] == "chat-123"
     assert transport.user_id == "agent47"
     assert transport.started == ("antigravity", options)
     assert options["request_id"] == "message-456"
+    assert output.state["user"] == "owui-user"
+    assert output.state["instance_user_id"] == "agent47"
+    assert owui_stubs["tokens"]["signed-1"]["user"] == "owui-user"
     assert options["cwd"] == "/srv/workspace"
     assert options["model"] == "gemini-4-hydrogen"
     assert "reasoning_effort" not in options["params"]
@@ -208,6 +262,10 @@ def test_empty_instructions_and_basic_text_turn(owui_stubs, monkeypatch):
     assert prompt == "USER: Hello"
     assert images == []
     assert transport.closed
+    assert [event["done"] for event in output.events] == [False, False, True]
+    assert [event["content"] for event in output.events] == ["hello ", "hello world", "hello world"]
+    assert [item["status"] for item in output.items] == ["completed", "completed"]
+    assert output.events[-1]["done"] is True and output.events[-1]["force"] is True
 
 
 @pytest.mark.parametrize(
@@ -246,11 +304,12 @@ def test_selected_effort_is_validated_and_passed_to_acp(owui_stubs, monkeypatch,
                 "messages": [{"role": "user", "content": "Think carefully"}],
                 "params": params,
             },
-            __metadata__={"chat_id": "chat-1", "message_id": "message-1"},
+            __user__={"id": "owui-user", "role": "user"},
+            __metadata__={"chat_id": "chat-123", "message_id": "message-1"},
         )
     )
 
-    options = owui_stubs[0][4]
+    options = owui_stubs["calls"][0][4]
     assert options["model"] == "gemini-4-hydrogen"
     assert options["params"]["reasoning_effort"] == "high"
     assert requests == [
@@ -279,7 +338,8 @@ def test_unsupported_effort_rejected(owui_stubs, monkeypatch, effort_key):
                     "messages": [{"role": "user", "content": "Hello"}],
                     "params": {effort_key: "high"},
                 },
-                __metadata__={"chat_id": "chat-1", "message_id": "message-1"},
+                __user__={"id": "owui-user", "role": "user"},
+                __metadata__={"chat_id": "chat-123", "message_id": "message-1"},
             )
         )
     assert len(DummyTransport.instances) == 1
@@ -295,7 +355,7 @@ def test_unsaved_chat_rejected_before_transport_start(owui_stubs):
                 __metadata__={"message_id": "message-1"},
             )
         )
-    assert owui_stubs == []
+    assert owui_stubs["calls"] == []
     assert DummyTransport.instances == []
 
 
@@ -306,7 +366,8 @@ def test_unavailable_model_rejected_before_transport_start(owui_stubs, monkeypat
         asyncio.run(
             pipe.pipe(
                 {"model": "antigravity.unknown", "messages": [{"role": "user", "content": "Hello"}]},
-                __metadata__={"chat_id": "chat-1", "message_id": "message-1"},
+                __user__={"id": "owui-user", "role": "user"},
+                __metadata__={"chat_id": "chat-123", "message_id": "message-1"},
             )
         )
     assert DummyTransport.instances == []
@@ -319,17 +380,180 @@ def test_empty_prompt_rejected_before_transport_start(owui_stubs, monkeypatch):
         asyncio.run(
             pipe.pipe(
                 {"model": "antigravity.gemini-4-hydrogen", "messages": []},
-                __metadata__={"chat_id": "chat-1", "message_id": "message-1"},
+                __user__={"id": "owui-user", "role": "user"},
+                __metadata__={"chat_id": "chat-123", "message_id": "message-1"},
             )
         )
     assert DummyTransport.instances == []
+
+
+def test_resume_uses_signed_state_for_actual_user_and_host_owner(owui_stubs, monkeypatch):
+    pipe = bridge.Pipe()
+    pipe.valves.user_id = "agent47"
+    prepare_pipe(monkeypatch, pipe)
+    owui_stubs["tokens"]["resume-token"] = {
+        "typ": "agent_session",
+        "user": "owui-user",
+        "chat": "chat-123",
+        "provider": "antigravity",
+        "model": "gemini-4-hydrogen",
+        "cwd": "/data/workspace",
+        "instance_user_id": "agent47",
+        "session_id": "saved-agy-session",
+    }
+    owui_stubs["messages"].setdefault("chat-123", {})["assistant-previous"] = {
+        "parentId": None,
+        "meta": {"agent": "resume-token"},
+    }
+
+    asyncio.run(pipe.pipe(
+        {"model": "antigravity.gemini-4-hydrogen", "messages": [{"role": "user", "content": "Continue"}]},
+        __user__={"id": "owui-user", "role": "user"},
+        __metadata__={"chat_id": "chat-123", "message_id": "message-next", "user_message": {"parentId": "assistant-previous"}},
+    ))
+    assert owui_stubs["calls"][0][4]["resume"] == "saved-agy-session"
+
+
+@pytest.mark.parametrize("claim, value", [("user", "other-user"), ("instance_user_id", "other-owner")])
+def test_resume_rejects_mismatched_signed_identities(owui_stubs, monkeypatch, claim, value):
+    pipe = bridge.Pipe()
+    pipe.valves.user_id = "agent47"
+    prepare_pipe(monkeypatch, pipe)
+    state = {
+        "typ": "agent_session", "user": "owui-user", "chat": "chat-123",
+        "provider": "antigravity", "model": "gemini-4-hydrogen", "cwd": "/data/workspace",
+        "instance_user_id": "agent47", "session_id": "saved-agy-session",
+    }
+    state[claim] = value
+    owui_stubs["tokens"]["mismatch-token"] = state
+    owui_stubs["messages"].setdefault("chat-123", {})["assistant-previous"] = {
+        "parentId": None, "meta": {"agent": "mismatch-token"},
+    }
+    asyncio.run(pipe.pipe(
+        {"model": "antigravity.gemini-4-hydrogen", "messages": [{"role": "user", "content": "Fresh start"}]},
+        __user__={"id": "owui-user", "role": "user"},
+        __metadata__={"chat_id": "chat-123", "message_id": "message-next", "user_message": {"parentId": "assistant-previous"}},
+    ))
+    assert owui_stubs["calls"][0][4]["resume"] is None
+
+
+def test_missing_authenticated_role_is_rejected(owui_stubs):
+    pipe = bridge.Pipe()
+    with pytest.raises(ValueError, match="user role"):
+        asyncio.run(pipe.pipe(
+            {"model": "antigravity.gemini-4-hydrogen", "messages": [{"role": "user", "content": "Hi"}]},
+            __user__={"id": "owui-user"},
+            __metadata__={"chat_id": "chat-123", "message_id": "message-1"},
+        ))
+
+
+@pytest.mark.parametrize("state_change", [
+    {"typ": "other_type"},
+    {"chat": "different-chat"},
+    {"provider": "other-provider"},
+    {"model": "other-model"},
+    {"cwd": "/other/workspace"},
+    {"session_id": ""},
+])
+def test_resume_rejects_out_of_scope_signed_state(owui_stubs, monkeypatch, state_change):
+    pipe = bridge.Pipe()
+    pipe.valves.user_id = "agent47"
+    prepare_pipe(monkeypatch, pipe)
+    state = {
+        "typ": "agent_session", "user": "owui-user", "chat": "chat-123",
+        "provider": "antigravity", "model": "gemini-4-hydrogen", "cwd": "/data/workspace",
+        "instance_user_id": "agent47", "session_id": "saved-agy-session",
+    }
+    state.update(state_change)
+    owui_stubs["tokens"]["out-of-scope-token"] = state
+    owui_stubs["messages"].setdefault("chat-123", {})["assistant-previous"] = {
+        "parentId": None, "meta": {"agent": "out-of-scope-token"},
+    }
+    asyncio.run(pipe.pipe(
+        {"model": "antigravity.gemini-4-hydrogen", "messages": [{"role": "user", "content": "Fresh start"}]},
+        __user__={"id": "owui-user", "role": "user"},
+        __metadata__={"chat_id": "chat-123", "message_id": "message-next", "user_message": {"parentId": "assistant-previous"}},
+    ))
+    assert owui_stubs["calls"][0][4]["resume"] is None
+
+
+def test_invalid_signed_state_falls_back_to_fresh_session(owui_stubs, monkeypatch):
+    pipe = bridge.Pipe()
+    pipe.valves.user_id = "agent47"
+    prepare_pipe(monkeypatch, pipe)
+    owui_stubs["tokens"]["bad-token"] = ValueError("invalid signature")
+    owui_stubs["messages"].setdefault("chat-123", {})["assistant-previous"] = {
+        "parentId": None, "meta": {"agent": "bad-token"},
+    }
+    asyncio.run(pipe.pipe(
+        {"model": "antigravity.gemini-4-hydrogen", "messages": [{"role": "user", "content": "Fresh start"}]},
+        __user__={"id": "owui-user", "role": "user"},
+        __metadata__={"chat_id": "chat-123", "message_id": "message-next", "user_message": {"parentId": "assistant-previous"}},
+    ))
+    assert owui_stubs["calls"][0][4]["resume"] is None
+
+
+def test_chat_access_denied_before_transport_creation(owui_stubs, monkeypatch):
+    pipe = bridge.Pipe()
+    owui_stubs["chats"].clear()
+    with pytest.raises(ValueError, match="access denied"):
+        asyncio.run(pipe.pipe(
+            {"model": "antigravity.gemini-4-hydrogen", "messages": [{"role": "user", "content": "Hi"}]},
+            __user__={"id": "owui-user", "role": "user"},
+            __metadata__={"chat_id": "chat-123", "message_id": "message-1"},
+        ))
+    assert DummyTransport.instances == []
+    assert owui_stubs["calls"] == []
+
+
+
+def test_cancellation_closes_transport_and_finalizes_output(owui_stubs, monkeypatch):
+    pipe = bridge.Pipe()
+    prepare_pipe(monkeypatch, pipe)
+    started = asyncio.Event()
+
+    async def blocked_acp(transport, output, prompt, images, options):
+        owui_stubs["calls"].append((transport, output, prompt, images, options))
+        output.on_flush = lambda done, force: setattr(output, "closed_before_final_flush", transport.closed) if done else None
+        await output.text("partial output")
+        started.set()
+        await asyncio.Event().wait()
+
+    sys.modules["open_webui.utils.agents"].acp.run = blocked_acp
+
+    async def run_cancelled_turn():
+        task = asyncio.create_task(
+            pipe.pipe(
+                {
+                    "model": "antigravity.gemini-4-hydrogen",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+                __user__={"id": "owui-user", "role": "user"},
+                __metadata__={"chat_id": "chat-123", "message_id": "message-cancel"},
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run_cancelled_turn())
+
+    assert DummyTransport.instances[-1].closed
+    cancelled_output = owui_stubs["calls"][-1][1]
+    assert cancelled_output.events[-1] == {"content": "partial output", "done": True, "force": True}
+    assert cancelled_output.closed_before_final_flush is True
+    assert [item["status"] for item in cancelled_output.items] == ["incomplete"]
 
 
 def test_transport_closes_when_acp_turn_raises(owui_stubs, monkeypatch):
     pipe = bridge.Pipe()
     prepare_pipe(monkeypatch, pipe)
 
-    async def failing_acp(*args, **kwargs):
+    async def failing_acp(transport, output, prompt, images, options):
+        owui_stubs["calls"].append((transport, output, prompt, images, options))
+        output.on_flush = lambda done, force: setattr(output, "closed_before_final_flush", transport.closed) if done else None
+        await output.text("partial", reasoning=True)
         raise RuntimeError("ACP failed")
 
     sys.modules["open_webui.utils.agents"].acp.run = failing_acp
@@ -340,7 +564,14 @@ def test_transport_closes_when_acp_turn_raises(owui_stubs, monkeypatch):
                     "model": "antigravity.gemini-4-hydrogen",
                     "messages": [{"role": "user", "content": "Hello"}],
                 },
-                __metadata__={"chat_id": "chat-1", "message_id": "message-1"},
+                __user__={"id": "owui-user", "role": "user"},
+                __metadata__={"chat_id": "chat-123", "message_id": "message-1"},
             )
         )
     assert DummyTransport.instances[-1].closed
+    failed_output = owui_stubs["calls"][-1][1]
+    assert failed_output.events[-1]["done"] is True
+    assert failed_output.events[-1]["force"] is True
+    assert failed_output.closed_before_final_flush is True
+    assert [item["status"] for item in failed_output.items] == ["incomplete"]
+    assert len(owui_stubs["calls"]) == 1

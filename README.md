@@ -33,9 +33,8 @@ Routing an ACP conversation to the dedicated host does not automatically make th
 ## Documentation
 
 - [Architecture findings, implementation direction, and verification plan](docs/architecture-findings.md)
+- [Phase-two design decisions, rationale, and acceptance checklist](docs/phase-2-design.md)
 
 ## Development status
 
-Phase one is implemented: dynamic base-model discovery and a basic text turn routed to the configured Open Terminal host. Reasoning effort from OWUI chat/model settings is accepted in snake_case or camelCase (including `custom_params`), validated against the selected model, and passed separately to OWUI's ACP runner. The user reports a successful live smoke test; automated tests cover discovery, routing, text turns, and effort handling.
-
-Phase one is not full ACP parity. Incremental streaming and saved-session resume, plus file/image attachments, remain future milestones. See [architecture findings](docs/architecture-findings.md) for implementation constraints and verification notes.
+Phase one passed a user-reported live smoke test. Phase two now implements streamed output, scoped signed-session resume, reasoning-effort validation, and OWUI-style success/error/cancellation finalization. The mocked suite passes, but phase-two live acceptance (including same-chat continuity and Stop behavior) remains pending. File/image attachments are not implemented. See [phase-two design](docs/phase-2-design.md) for rationale, limits, and the live acceptance checklist.
