@@ -162,7 +162,9 @@ class Pipe:
             "chat": str(chat_id),
         }
         params = body.get("params") or {}
-        reasoning_effort = params.get("reasoning_effort")
+        custom_params = params.get("custom_params") or {}
+        reasoning_effort = params.get("reasoningEffort") or params.get("reasoning_effort")
+        reasoning_effort = reasoning_effort or custom_params.get("reasoningEffort") or custom_params.get("reasoning_effort")
         if reasoning_effort:
             # Fetch discovery metadata to validate effort against the selected base model.
             catalog = await self._request(
@@ -179,6 +181,9 @@ class Pipe:
             }
             if reasoning_effort not in supported:
                 raise ValueError("The selected reasoning effort is not supported by this model")
+            # Match OWUI's helper: custom params are overlaid on top-level params.
+            params = {**params, **custom_params}
+            params["reasoning_effort"] = reasoning_effort.strip() if isinstance(reasoning_effort, str) else reasoning_effort
 
         options = {
             "request_id": str(message_id),

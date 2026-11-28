@@ -203,10 +203,87 @@ def test_empty_instructions_and_basic_text_turn(owui_stubs, monkeypatch):
     assert options["request_id"] == "message-456"
     assert options["cwd"] == "/srv/workspace"
     assert options["model"] == "gemini-4-hydrogen"
+    assert "reasoning_effort" not in options["params"]
     assert isinstance(options["instructions"], str) and options["instructions"] == ""
     assert prompt == "USER: Hello"
     assert images == []
     assert transport.closed
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"reasoning_effort": "high"},
+        {"reasoningEffort": "high"},
+        {"custom_params": {"reasoning_effort": "high"}},
+        {"custom_params": {"reasoningEffort": "high"}},
+    ],
+)
+def test_selected_effort_is_validated_and_passed_to_acp(owui_stubs, monkeypatch, params):
+    pipe = bridge.Pipe()
+    prepare_pipe(monkeypatch, pipe)
+    requests = []
+
+    async def request(method, path, **kwargs):
+        requests.append((method, path, kwargs))
+        return catalog(
+            models=[
+                {
+                    "id": "gemini-4-hydrogen",
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "low"},
+                        {"reasoningEffort": "high"},
+                    ],
+                }
+            ]
+        )
+
+    monkeypatch.setattr(pipe, "_request", request)
+    asyncio.run(
+        pipe.pipe(
+            {
+                "model": "antigravity.gemini-4-hydrogen",
+                "messages": [{"role": "user", "content": "Think carefully"}],
+                "params": params,
+            },
+            __metadata__={"chat_id": "chat-1", "message_id": "message-1"},
+        )
+    )
+
+    options = owui_stubs[0][4]
+    assert options["model"] == "gemini-4-hydrogen"
+    assert options["params"]["reasoning_effort"] == "high"
+    assert requests == [
+        (
+            "GET",
+            "/agents",
+            {"params": {"provider": "antigravity", "cwd": "/data/workspace"}},
+        )
+    ]
+
+
+@pytest.mark.parametrize("effort_key", ["reasoning_effort", "reasoningEffort"])
+def test_unsupported_effort_rejected(owui_stubs, monkeypatch, effort_key):
+    pipe = bridge.Pipe()
+    prepare_pipe(monkeypatch, pipe)
+
+    async def request(*args, **kwargs):
+        return catalog(models=[{"id": "gemini-4-hydrogen", "supportedReasoningEfforts": []}])
+
+    monkeypatch.setattr(pipe, "_request", request)
+    with pytest.raises(ValueError, match="reasoning effort"):
+        asyncio.run(
+            pipe.pipe(
+                {
+                    "model": "antigravity.gemini-4-hydrogen",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "params": {effort_key: "high"},
+                },
+                __metadata__={"chat_id": "chat-1", "message_id": "message-1"},
+            )
+        )
+    assert len(DummyTransport.instances) == 1
+    assert DummyTransport.instances[0].started is None
 
 
 def test_unsaved_chat_rejected_before_transport_start(owui_stubs):

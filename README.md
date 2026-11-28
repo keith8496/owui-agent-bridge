@@ -14,7 +14,7 @@ The initial provider is Antigravity through `agy` ACP. ACP requests and response
 - Target Open WebUI version: 0.13.5.
 - The Manifold exposes agent models in the regular OWUI model picker.
 - Agent host URL and API key are configured through Pipe Valves. A user ID Valve may be provided when required, defaulting to `user`.
-- The Manifold discovers available models from the agent host and returns them through its dynamic model list (`pipes()`). Discovery must retain the provider's base model name and represent effort separately; do not synthesize picker IDs such as `gemini-3-high`.
+- The Manifold discovers available models from the agent host and returns them through its dynamic model list (`pipes()`). Discovery retains base model IDs; chat-selected reasoning effort is passed separately through ACP config options, never encoded into picker IDs such as `gemini-3-high`.
 - Chat behavior should match the existing OWUI ACP implementation, reusing its supported prompt handling, streaming, session behavior, attachments, events, cancellation, and cleanup rather than defining a parallel protocol contract.
 - Agent-host routing is independent of the currently selected workspace machine.
 
@@ -36,4 +36,6 @@ Routing an ACP conversation to the dedicated host does not automatically make th
 
 ## Development status
 
-Documentation and source investigation only; no Manifold implementation or runtime test exists yet. Before coding, inspect the exact Open WebUI 0.13.5 ACP call signatures and model-discovery path, then implement the smallest adapter that redirects the existing ACP transport to the configured Open Terminal host.
+Phase one is implemented: dynamic base-model discovery and a basic text turn routed to the configured Open Terminal host. Reasoning effort from OWUI chat/model settings is accepted in snake_case or camelCase (including `custom_params`), validated against the selected model, and passed separately to OWUI's ACP runner. The user reports a successful live smoke test; automated tests cover discovery, routing, text turns, and effort handling.
+
+Phase one is not full ACP parity. Incremental streaming and saved-session resume, plus file/image attachments, remain future milestones. See [architecture findings](docs/architecture-findings.md) for implementation constraints and verification notes.

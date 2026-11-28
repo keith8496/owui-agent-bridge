@@ -1,15 +1,15 @@
 # OWUI + Open Terminal Agent Bridge
 
-Status: Phase-one discovery and basic text-turn implementation is in place. Unit tests pass, and a user-reported smoke test passed. Streaming/resume and attachment/image parity remain future milestones.
+Status: Phase one is implemented and user-smoke-tested: dynamic model discovery, basic text turns, and chat-selected reasoning effort routed to the configured host. Automated tests cover effort input formats and validation. Streaming/resume and attachment/image parity remain future milestones.
 
 ## Agreed implementation requirements
 
 - Ship the final deliverable as one installable Python Open WebUI Pipe/Manifold file.
 - Target Open WebUI 0.13.5.
 - Expose ACP agent models in the regular OWUI model picker and route their requests to a configured dedicated Open Terminal agent host, regardless of which workspace machine remains selected in the chat UI.
-- Use a thin adapter around OWUI's existing ACP implementation. Prefer importing/calling its existing logic; keep copied code to the minimum needed to bridge the Pipe to the dedicated host. Expect private internal APIs to be version-sensitive and verify their exact 0.13.5 signatures before implementation.
+- Use a thin adapter around OWUI's existing ACP implementation. Prefer importing/calling its existing logic; keep copied code to the minimum needed to bridge the Pipe to the dedicated host. Expect private internal APIs to be version-sensitive; the phase-one implementation was checked against OWUI 0.13.5 signatures.
 - Configure the agent-host URL and API key using Pipe Valves. Include a user ID Valve only if the host/API requires it; default it to `user`.
-- Discover models from the agent host and expose them through the Manifold's dynamic model list (`pipes()`). Keep base model IDs and effort as separate values/options; do not create picker IDs by concatenating effort, for example `gemini-3-high`.
+- Discover models from the agent host and expose them through the Manifold's dynamic model list (`pipes()`). Keep base model IDs separate from reasoning effort; do not create picker IDs by concatenating effort, for example `gemini-3-high`. OWUI-selected effort is read from request params and passed to ACP config-option handling.
 - Follow the existing OWUI ACP implementation for supported chat behavior, session semantics, authentication/ownership expectations, event handling, cancellation, and cleanup. The desired end state is feature-to-feature parity, not a permanently text-only replacement.
 
 ### Delivery milestones
@@ -158,18 +158,14 @@ At each phase confirm the foreground workspace selection is unchanged, requests 
 
 ## Remaining implementation checks
 
-These are source/runtime checks for implementation, not unresolved product choices:
-
-- Confirm exact import paths, call signatures, and injectable seams in the locally available OWUI 0.13.5 source; internal imports are intentionally accepted but version-sensitive.
-- Confirm model-discovery response shape and how ACP effort/options are represented for `agy`; expose one picker entry per base model and pass effort separately.
-- Confirm the host authentication and optional user-ID requirements, and preserve Open Terminal's session ownership checks.
-- Confirm Pipe support for the existing ACP update/event flow, cancellation, and session state in this OWUI version.
-- Confirm attachment and image payload encoding against the existing OWUI ACP implementation and Open Terminal transport.
-- Test actual filesystem/shell execution location; do not infer remote workspace access from routing or shared files.
+- Exercise effort changes live in OWUI chat settings and confirm the selected value reaches the agent's `thought_level` config option across model changes.
+- Implement streaming and saved-session resume parity; the current phase-one Pipe returns the final response and starts a fresh agent session for each turn.
+- Add attachment and image support, including base64 payloads where required by the ACP path.
+- In the live deployment, confirm cancellation/cleanup and verify filesystem/shell execution location; do not infer remote workspace access from routing or shared files.
 
 ## Verification status
 
 - Open WebUI source signatures were inspected against tag `v0.13.5`; Open Terminal protocol details were checked in the local source.
 - The single-file phase-one implementation is `owui_agent_bridge.py`; it dynamically discovers available Antigravity base models, uses Valve-configured host/key/user ID, and calls OWUI's ACP runner and reconnectable carrier.
-- `tests/test_owui_agent_bridge.py` covers discovery, config/routing, session payload, basic text turn, input rejection, and cleanup. Unit tests pass; the user also reports a successful smoke test in their OWUI/Open Terminal instance.
+- `tests/test_owui_agent_bridge.py` covers discovery, config/routing, session payload, basic text turn, input rejection, cleanup, and reasoning-effort snake_case/camelCase plus nested `custom_params` handling. Unit tests pass; the user also reports a successful smoke test in their OWUI/Open Terminal instance.
 - Phase one does not yet provide streaming/resume parity or file/image attachment support. Do not treat it as full feature parity.
